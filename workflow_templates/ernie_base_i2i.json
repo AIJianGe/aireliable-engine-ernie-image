@@ -1,0 +1,105 @@
+{
+  "_meta": {
+    "name": "ERNIE-Image Base I2I",
+    "description": "ERNIE-Image 标准图生图（50 步高质量推理），不含 Prompt Enhancer。源图经 VAEEncode 编码为 latent 后，KSampler 以 denoise 强度重绘",
+    "variant": "ernie-image-gguf-q4-k-m",
+    "mode": "i2i",
+    "default_steps": 50,
+    "default_guidance": 5.0,
+    "default_denoise": 0.6,
+    "supports_pe": false,
+    "placeholders": {
+      "__PROMPT__": "正向提示词（必填，描述期望的修改效果）",
+      "__NEGATIVE_PROMPT__": "负向提示词（默认空）",
+      "__WIDTH__": "宽度（i2i 模式下被源图实际尺寸覆盖，仅日志使用）",
+      "__HEIGHT__": "高度（同上）",
+      "__STEPS__": "推理步数（默认 50）",
+      "__CFG__": "引导系数（默认 5.0）",
+      "__SEED__": "随机种子（默认 0=随机）",
+      "__GGUF_FILENAME__": "GGUF 主权重文件名",
+      "__VAE_FILENAME__": "VAE 文件名",
+      "__TEXT_ENCODER_FILENAME__": "Text Encoder 文件名",
+      "__SOURCE_IMAGE__": "源图文件名（引擎落盘到 ComfyUI input 目录，{task_id}_source.png）",
+      "__DENOISE__": "重绘强度 0.0-1.0（默认 0.6，越小越贴近源图）"
+    },
+    "notes": [
+      "节点链：LoadImage → VAEEncode → KSampler(denoise=__DENOISE__) → VAEDecode → SaveImage",
+      "与 turbo 版差异仅默认参数（steps 50 / cfg 5.0），节点结构完全一致"
+    ]
+  },
+  "1": {
+    "class_type": "UnetLoaderGGUF",
+    "inputs": {
+      "unet_name": "__GGUF_FILENAME__"
+    }
+  },
+  "2": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "__TEXT_ENCODER_FILENAME__",
+      "type": "stable_diffusion"
+    }
+  },
+  "3": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "__PROMPT__",
+      "clip": ["2", 0]
+    }
+  },
+  "4": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "__NEGATIVE_PROMPT__",
+      "clip": ["2", 0]
+    }
+  },
+  "5": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "__SOURCE_IMAGE__"
+    }
+  },
+  "6": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "__VAE_FILENAME__"
+    }
+  },
+  "7": {
+    "class_type": "VAEEncode",
+    "inputs": {
+      "pixels": ["5", 0],
+      "vae": ["6", 0]
+    }
+  },
+  "8": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model": ["1", 0],
+      "positive": ["3", 0],
+      "negative": ["4", 0],
+      "latent_image": ["7", 0],
+      "seed": "__SEED__",
+      "steps": "__STEPS__",
+      "cfg": "__CFG__",
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": "__DENOISE__"
+    }
+  },
+  "9": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": ["8", 0],
+      "vae": ["6", 0]
+    }
+  },
+  "10": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": ["9", 0],
+      "filename_prefix": "ERNIE_Image_I2I"
+    }
+  }
+}

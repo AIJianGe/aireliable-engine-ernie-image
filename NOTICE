@@ -1,0 +1,13 @@
+ERNIE-Image (ComfyUI) (ernie_image_909469ed)
+Copyright (c) 2026 AIReliable Team. All rights reserved.
+
+License: AIReliable Engine License 1.0（source-available，非 OSI 开源）
+Engine repository: 待发布
+Engine version: 0.3.0
+
+本引擎可能使用或按需下载以下第三方组件，其版权与许可归各自作者所有：
+
+- ERNIE-Image | License: Apache-2.0
+- ComfyUI | License: GPL-3.0
+- ComfyUI-GGUF | License: MIT
+- Ministral3 PE | License: Apache-2.0

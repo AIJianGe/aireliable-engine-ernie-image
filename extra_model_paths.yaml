@@ -1,0 +1,13 @@
+ernie_image_platform:
+  unet: D:\myProInstallDir\AIReliable\models\image\unet/
+  diffusion_models: D:\myProInstallDir\AIReliable\models\image\unet/
+  vae: D:\myProInstallDir\AIReliable\models\image\vae\ernie-image/
+  clip: 'D:\myProInstallDir\AIReliable\models\shared\text_encoders\ernie-image/
+
+    D:\myProInstallDir\AIReliable\models\image\pe\ernie-image/'
+  text_encoders: 'D:\myProInstallDir\AIReliable\models\shared\text_encoders\ernie-image/
+
+    D:\myProInstallDir\AIReliable\models\image\pe\ernie-image/'
+  llm: D:\myProInstallDir\AIReliable\models\image\pe\ernie-image/
+  tokenizers: D:\myProInstallDir\AIReliable\models\shared\tokenizer\ernie-image\tokenizer/
+  loras: D:\myProInstallDir\AIReliable\models\image\loras\ernie-image/

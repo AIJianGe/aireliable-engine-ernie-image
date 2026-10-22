@@ -1,0 +1,133 @@
+{
+  "_meta": {
+    "name": "ERNIE-Image Turbo I2I + PE",
+    "description": "ERNIE-Image Turbo 图生图（8 步）+ Prompt Enhancer（Ministral3 PE 增强提示词）。PE 链复用 CLIPLoader(type=flux2) + TextGenerate 标准节点",
+    "variant": "ernie-image-turbo-gguf-q4-k-m",
+    "mode": "i2i",
+    "default_steps": 8,
+    "default_guidance": 1.0,
+    "default_denoise": 0.6,
+    "supports_pe": true,
+    "placeholders": {
+      "__PROMPT__": "正向提示词（PE 增强前的原始提示词，必填）",
+      "__NEGATIVE_PROMPT__": "负向提示词（默认空）",
+      "__WIDTH__": "宽度（i2i 模式下为源图实际尺寸，PE 系统提示词使用）",
+      "__HEIGHT__": "高度（同上）",
+      "__STEPS__": "推理步数（默认 8）",
+      "__CFG__": "引导系数（默认 1.0）",
+      "__SEED__": "随机种子（默认 0=随机）",
+      "__GGUF_FILENAME__": "GGUF 主权重文件名",
+      "__VAE_FILENAME__": "VAE 文件名",
+      "__TEXT_ENCODER_FILENAME__": "Text Encoder 文件名",
+      "__PE_FILENAME__": "PE 权重文件名（含 tekken_model 的 model_with_tokenizer.safetensors）",
+      "__PE_PROMPT__": "PE 系统提示词（engine.py 构建，含 <s>[SYSTEM_PROMPT]...[/INST] 模板，width/height 用源图实际尺寸）",
+      "__SOURCE_IMAGE__": "源图文件名（引擎落盘到 ComfyUI input 目录，{task_id}_source.png）",
+      "__DENOISE__": "重绘强度 0.0-1.0（默认 0.6，越小越贴近源图）"
+    },
+    "notes": [
+      "PE（Prompt Enhancer）基于 Ministral3 模型，用 CLIPLoader(type=flux2) 加载",
+      "TextGenerate 节点执行 LLM 推理生成增强 prompt，输出接正向 CLIPTextEncode",
+      "节点链：LoadImage → VAEEncode → KSampler(denoise=__DENOISE__) → VAEDecode → SaveImage",
+      "use_default_template=false：跳过 ComfyUI 默认模板，使用 engine.py 构建的完整 <s>[SYSTEM_PROMPT] 模板"
+    ]
+  },
+  "1": {
+    "class_type": "UnetLoaderGGUF",
+    "inputs": {
+      "unet_name": "__GGUF_FILENAME__"
+    }
+  },
+  "2": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "__TEXT_ENCODER_FILENAME__",
+      "type": "flux2"
+    }
+  },
+  "10": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "__PE_FILENAME__",
+      "type": "flux2"
+    }
+  },
+  "11": {
+    "class_type": "TextGenerate",
+    "inputs": {
+      "clip": ["10", 0],
+      "prompt": "__PE_PROMPT__",
+      "max_length": 2048,
+      "sampling_mode": "on",
+      "sampling_mode.temperature": 0.6,
+      "sampling_mode.top_k": 64,
+      "sampling_mode.top_p": 0.8,
+      "sampling_mode.min_p": 0.05,
+      "sampling_mode.repetition_penalty": 1.05,
+      "sampling_mode.seed": 0,
+      "thinking": false,
+      "use_default_template": false
+    }
+  },
+  "3": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": ["11", 0],
+      "clip": ["2", 0]
+    }
+  },
+  "4": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "__NEGATIVE_PROMPT__",
+      "clip": ["2", 0]
+    }
+  },
+  "5": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "__SOURCE_IMAGE__"
+    }
+  },
+  "6": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "__VAE_FILENAME__"
+    }
+  },
+  "7": {
+    "class_type": "VAEEncode",
+    "inputs": {
+      "pixels": ["5", 0],
+      "vae": ["6", 0]
+    }
+  },
+  "8": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model": ["1", 0],
+      "positive": ["3", 0],
+      "negative": ["4", 0],
+      "latent_image": ["7", 0],
+      "seed": "__SEED__",
+      "steps": "__STEPS__",
+      "cfg": "__CFG__",
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": "__DENOISE__"
+    }
+  },
+  "9": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": ["8", 0],
+      "vae": ["6", 0]
+    }
+  },
+  "12": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": ["9", 0],
+      "filename_prefix": "ERNIE_Image_I2I_PE"
+    }
+  }
+}

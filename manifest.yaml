@@ -1,0 +1,261 @@
+engine_id: ernie_image_909469ed
+engine_name: ERNIE-Image (ComfyUI)
+engine_version: 0.3.0
+aireliable_compat: '>=0.0.16'
+uv_env_name: image-ernie-comfyui
+export_mode: source
+description: ERNIE-Image 文生图引擎（ComfyUI 子进程模式，v0.3.0 推倒重来）
+engine_uid: aireliable://paddlepaddle/image/ernie_image
+# v0.3.0 关键变更：paradigm 从 workflow 改为 integrated（ComfyUI 子进程模式）
+paradigm: integrated
+sdk_version: '>=0.3.0'
+
+# 作者信息
+author:
+  name: AI剑歌
+
+# 第三方开源引用
+third_party_references:
+  - name: ERNIE-Image
+    author: PaddlePaddle
+    github: https://github.com/PaddlePaddle/ERNIE-Image
+    license: Apache-2.0
+    description: 引擎核心文生图能力来自 PaddlePaddle 的 ERNIE-Image 模型
+  - name: ComfyUI
+    author: comfyanonymous
+    github: https://github.com/comfyanonymous/ComfyUI
+    license: GPL-3.0
+    description: 工作流执行引擎（v0.32.0 稳定版），ERNIE-Image 通过 ComfyUI 子进程加载
+  - name: ComfyUI-GGUF
+    author: Randy420Marsh
+    github: https://github.com/Randy420Marsh/ComfyUI-GGUF
+    license: MIT
+    description: ERNIE-Image arch + mistral3 text-encoder arch + tekken tokenizer 重建
+  - name: Ministral3 PE
+    author: PaddlePaddle
+    license: Apache-2.0
+    description: Prompt Enhancer（PE）组件基于 Ministral3 模型实现提示词增强
+
+source:
+  type: github
+  github_repo: PaddlePaddle/ERNIE-Image
+upgrade:
+  check_url: https://api.github.com/repos/PaddlePaddle/ERNIE-Image/releases/latest
+  auto_check: false
+node_packages: []
+extra:
+  custom_node_dependencies: []
+
+# v0.2.5+ 引擎环境配置（env_config 块）
+env_config:
+  requires_torch: true
+  torch_version_constraint: '>=2.7.0'
+  default_cuda_version: cu128
+  supported_cuda_versions:
+    - cu128
+  requires_python: '>=3.10,<3.12'
+  notes: 'ComfyUI v0.32.0 需要 torch 2.7+，ERNIE-Image 通过 ComfyUI-GGUF 扩展加载'
+  recommended_versions:
+    torch: '2.13.0'
+    torchvision: '0.28.0'
+    torchaudio: null
+    reason: 'ComfyUI v0.32.0 + ComfyUI-GGUF（Randy420Marsh fork）测试通过的稳定版本组合'
+
+models:
+  model_layout:
+    # v0.3.0：保持平台现有模型目录结构（平台规范优先）
+    base: image/unet/                     # GGUF 主权重
+    lora: image/loras/ernie-image/         # LoRA
+    vae: image/vae/ernie-image/            # VAE
+    text_encoder: shared/text_encoders/ernie-image/  # Text Encoder（Ministral3）
+    pe: image/pe/ernie-image/              # Prompt Enhancer（Ministral3）
+    tokenizer: shared/tokenizer/ernie-image/  # Tokenizer
+
+  # v0.3.0：默认 Turbo（8 步快速推理）
+  default_variant: ernie-image-turbo-gguf-q4-k-m
+
+  variants:
+  - name: ernie-image-gguf-q4-k-m
+    alias: ernie-q4
+    base_model: ernie-image-sft
+    precision: q4_k_m
+    loader: gguf
+    vram_required: 8GB
+    path: image/unet/ernie-image-Q4_K_M.gguf
+    model_file_ids:
+    # 主权重（互斥组：ernie-image-main）
+    - ernie-image-q4-k-m-gguf
+    # 共享组件
+    - ernie-vae-safetensors
+    - ernie-text-encoder-safetensors
+    - ernie-pe-safetensors
+    - ernie-tokenizer
+    - ernie-pe-tokenizer
+    default_steps: 50
+    default_guidance: 5.0
+    supports_pe: true
+  - name: ernie-image-turbo-gguf-q4-k-m
+    alias: ernie-turbo
+    base_model: ernie-image-turbo
+    precision: q4_k_m
+    loader: gguf
+    vram_required: 8GB
+    path: image/unet/ernie-image-turbo-Q4_K_M.gguf
+    model_file_ids:
+    # 主权重（互斥组：ernie-image-main）
+    - ernie-image-turbo-q4-k-m-gguf
+    # 共享组件（与 base 完全相同）
+    - ernie-vae-safetensors
+    - ernie-text-encoder-safetensors
+    - ernie-pe-safetensors
+    - ernie-tokenizer
+    - ernie-pe-tokenizer
+    default_steps: 8
+    default_guidance: 1.0
+    supports_pe: true
+
+  # v0.3.0：model_files 精简（删除 diffusers 风格的 config.json / scheduler_config.json /
+  # model_index.json / generation_config.json 等 < 5KB 配置文件，ComfyUI 不需要）
+  # 文件名保持平台现状（v1.2 平台规范优先原则）
+  model_files:
+  # ===== GGUF 主权重（2 个 variant 互斥）=====
+  - id: ernie-image-q4-k-m-gguf
+    role: main
+    filename: ernie-image-Q4_K_M.gguf
+    target_dir: image/unet/
+    size_bytes: 5019124416
+    precision: q4_k_m
+    format: gguf
+    exclusive_group: ernie-image-main        # 2 个 GGUF 主权重互斥（下载一个就能跑）
+    required_for: [ernie-image-gguf-q4-k-m]
+    source:
+      type: huggingface
+      repo_id: unsloth/ERNIE-Image-GGUF
+      filename: ernie-image-Q4_K_M.gguf
+      url: https://huggingface.co/unsloth/ERNIE-Image-GGUF/resolve/main/ernie-image-Q4_K_M.gguf
+      mirror_url: https://hf-mirror.com/unsloth/ERNIE-Image-GGUF/resolve/main/ernie-image-Q4_K_M.gguf
+    description: ERNIE-Image 标准版 Q4_K_M 量化（约 4.67GB，ComfyUI UnetLoaderGGUF 节点加载）
+  - id: ernie-image-turbo-q4-k-m-gguf
+    role: main
+    filename: ernie-image-turbo-Q4_K_M.gguf
+    target_dir: image/unet/
+    size_bytes: 5019124416
+    precision: q4_k_m
+    format: gguf
+    exclusive_group: ernie-image-main
+    required_for: [ernie-image-turbo-gguf-q4-k-m]
+    source:
+      type: huggingface
+      repo_id: unsloth/ERNIE-Image-Turbo-GGUF
+      filename: ernie-image-turbo-Q4_K_M.gguf
+      url: https://huggingface.co/unsloth/ERNIE-Image-Turbo-GGUF/resolve/main/ernie-image-turbo-Q4_K_M.gguf
+      mirror_url: https://hf-mirror.com/unsloth/ERNIE-Image-Turbo-GGUF/resolve/main/ernie-image-turbo-Q4_K_M.gguf
+    description: ERNIE-Image Turbo 极速版 Q4_K_M 量化（约 4.67GB，8 步快速推理）
+
+  # ===== VAE（跨 variant 共享）=====
+  # v1.2 平台规范优先：文件名保持平台现状 diffusion_pytorch_model.safetensors
+  # ComfyUI 工作流模板中 VAELoader 节点的 vae_name 用此文件名
+  - id: ernie-vae-safetensors
+    role: vae
+    filename: diffusion_pytorch_model.safetensors
+    target_dir: image/vae/ernie-image/
+    size_bytes: 168120878
+    precision: fp32
+    format: safetensors
+    required_for: [ernie-image-gguf-q4-k-m, ernie-image-turbo-gguf-q4-k-m]
+    source:
+      type: huggingface
+      repo_id: Baidu/ERNIE-Image
+      subdir: vae
+      filename: diffusion_pytorch_model.safetensors
+    description: VAE 解码器权重（~160MB，跨 variant 共享，ComfyUI VAELoader 节点加载）
+
+  # ===== Text Encoder（Ministral3，跨 variant 共享）=====
+  # v1.3 修订（T4.2）：原 multimodal Mistral3（带 language_model. 前缀 + vision_tower.*）
+  # 无法被 ComfyUI 的 detect_te_model 识别为 Ministral3-3B（hidden=3072），
+  # 导致退化到 SD1ClipModel → 推理时报 "Cannot copy out of meta tensor; no data!"。
+  # 修复：通过 _convert_text_encoder.py 预处理生成 model_text_only.safetensors，
+  # 剥离 language_model. 前缀并丢弃 vision_tower.* 视觉塔权重，
+  # 保留 model.layers.X.* 键名格式，ComfyUI 自动检测为 TEModel.MINISTRAL_3_3B。
+  # 平台规范优先原则：不修改原 model.safetensors 文件，新增 model_text_only.safetensors。
+  - id: ernie-text-encoder-safetensors
+    role: text_encoder
+    filename: model_text_only.safetensors
+    target_dir: shared/text_encoders/ernie-image/
+    size_bytes: 6891597144
+    precision: bf16
+    format: safetensors
+    required_for: [ernie-image-gguf-q4-k-m, ernie-image-turbo-gguf-q4-k-m]
+    source:
+      type: huggingface
+      repo_id: Baidu/ERNIE-Image
+      subdir: text_encoder
+      filename: model.safetensors
+      # 转换说明：source 是 multimodal Mistral3 原始文件，
+      # 通过 engines/ernie_image_909469ed/_convert_text_encoder.py 转换为本文件
+      extra:
+        convert_required: true
+        convert_script: engines/ernie_image_909469ed/_convert_text_encoder.py
+    description: Mistral3 文本编码器权重（text-only，~6.4GB，跨 variant 共享，ComfyUI CLIPLoader 节点加载）
+
+  # ===== Prompt Enhancer（Ministral3，跨 variant 共享）=====
+  # v1.3 修订（T4.4）：原 model.safetensors 缺少 tekken_model 键，
+  # ComfyUI Mistral3Tokenizer 初始化时报 TypeError。
+  # 修复：通过 _convert_pe_model.py 预处理生成 model_with_tokenizer.safetensors，
+  # 从 pe_tokenizer/tokenizer.json 重建 tekken_model 并嵌入 safetensors。
+  # 平台规范优先原则：不修改原 model.safetensors 文件，新增 model_with_tokenizer.safetensors。
+  - id: ernie-pe-safetensors
+    role: pe
+    filename: model_with_tokenizer.safetensors
+    target_dir: image/pe/ernie-image/
+    size_bytes: 7672568874
+    precision: bf16
+    format: safetensors
+    required_for: [ernie-image-gguf-q4-k-m, ernie-image-turbo-gguf-q4-k-m]
+    source:
+      type: huggingface
+      repo_id: Baidu/ERNIE-Image
+      subdir: pe
+      filename: model.safetensors
+      # 转换说明：source 是不含 tekken_model 的原始 PE 文件，
+      # 通过 engines/ernie_image_909469ed/_convert_pe_model.py 转换为本文件
+      extra:
+        convert_required: true
+        convert_script: engines/ernie_image_909469ed/_convert_pe_model.py
+    description: PE（Ministral3）权重（~7.15GB，含 tekken_model，跨 variant 共享，ComfyUI CLIPLoader(type=flux2) + TextGenerate 节点加载）
+
+  # ===== Tokenizer（跨 variant 共享）=====
+  - id: ernie-tokenizer
+    role: tokenizer
+    filename: tokenizer.json
+    target_dir: shared/tokenizer/ernie-image/tokenizer/
+    size_bytes: 17078110
+    format: json
+    required_for: [ernie-image-gguf-q4-k-m, ernie-image-turbo-gguf-q4-k-m]
+    source:
+      type: huggingface
+      repo_id: Baidu/ERNIE-Image
+      subdir: tokenizer
+      filename: tokenizer.json
+    description: Tokenizer 主词表（~17MB，跨 variant 共享）
+
+  # ===== PE Tokenizer（跨 variant 共享）=====
+  - id: ernie-pe-tokenizer
+    role: tokenizer
+    filename: tokenizer.json
+    target_dir: shared/tokenizer/ernie-image/pe_tokenizer/
+    size_bytes: 17077402
+    format: json
+    required_for: [ernie-image-gguf-q4-k-m, ernie-image-turbo-gguf-q4-k-m]
+    source:
+      type: huggingface
+      repo_id: Baidu/ERNIE-Image
+      subdir: pe_tokenizer
+      filename: tokenizer.json
+    description: PE 专属 tokenizer（~17MB，跨 variant 共享）
+
+  # ===== LoRA 扫描配置 =====
+  loras:
+    scan_dir: image/loras/ernie-image/
+    format: safetensors
+    runtime_switch: true

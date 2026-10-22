@@ -1,0 +1,114 @@
+{
+  "_meta": {
+    "name": "ERNIE-Image Base Edit (Inpaint)",
+    "description": "ERNIE-Image 标准图片编辑（通用 inpaint 方案，50 步高质量）。LoadImageMask 提取重绘区域，VAEEncodeForInpaint 生成带 noise_mask 的 latent，非 mask 区域保留源图内容",
+    "variant": "ernie-image-gguf-q4-k-m",
+    "mode": "edit",
+    "default_steps": 50,
+    "default_guidance": 5.0,
+    "supports_pe": false,
+    "placeholders": {
+      "__PROMPT__": "正向提示词（必填，描述 mask 区域期望生成的内容）",
+      "__NEGATIVE_PROMPT__": "负向提示词（默认空）",
+      "__WIDTH__": "宽度（edit 模式下被源图实际尺寸覆盖，仅日志使用）",
+      "__HEIGHT__": "高度（同上）",
+      "__STEPS__": "推理步数（默认 50）",
+      "__CFG__": "引导系数（默认 5.0）",
+      "__SEED__": "随机种子（默认 0=随机）",
+      "__GGUF_FILENAME__": "GGUF 主权重文件名",
+      "__VAE_FILENAME__": "VAE 文件名",
+      "__TEXT_ENCODER_FILENAME__": "Text Encoder 文件名",
+      "__SOURCE_IMAGE__": "源图文件名（引擎落盘到 ComfyUI input 目录，{task_id}_source.png）",
+      "__MASK_IMAGE__": "mask 文件名（引擎归一化后落盘，{task_id}_mask.png，白=重绘区）"
+    },
+    "notes": [
+      "节点链：LoadImage + LoadImageMask(channel=red) → VAEEncodeForInpaint(grow_mask_by=6) → KSampler(denoise=1.0) → VAEDecode → SaveImage",
+      "与 turbo 版差异仅默认参数（steps 50 / cfg 5.0），节点结构完全一致",
+      "mask 语义：白色（255）= 重绘区；denoise 固定 1.0，重绘区域由 noise_mask 控制"
+    ]
+  },
+  "1": {
+    "class_type": "UnetLoaderGGUF",
+    "inputs": {
+      "unet_name": "__GGUF_FILENAME__"
+    }
+  },
+  "2": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "__TEXT_ENCODER_FILENAME__",
+      "type": "stable_diffusion"
+    }
+  },
+  "3": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "__PROMPT__",
+      "clip": ["2", 0]
+    }
+  },
+  "4": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "__NEGATIVE_PROMPT__",
+      "clip": ["2", 0]
+    }
+  },
+  "5": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "__SOURCE_IMAGE__"
+    }
+  },
+  "6": {
+    "class_type": "LoadImageMask",
+    "inputs": {
+      "image": "__MASK_IMAGE__",
+      "channel": "red"
+    }
+  },
+  "7": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "__VAE_FILENAME__"
+    }
+  },
+  "8": {
+    "class_type": "VAEEncodeForInpaint",
+    "inputs": {
+      "pixels": ["5", 0],
+      "vae": ["7", 0],
+      "mask": ["6", 0],
+      "grow_mask_by": 6
+    }
+  },
+  "9": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model": ["1", 0],
+      "positive": ["3", 0],
+      "negative": ["4", 0],
+      "latent_image": ["8", 0],
+      "seed": "__SEED__",
+      "steps": "__STEPS__",
+      "cfg": "__CFG__",
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1.0
+    }
+  },
+  "10": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": ["9", 0],
+      "vae": ["7", 0]
+    }
+  },
+  "11": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": ["10", 0],
+      "filename_prefix": "ERNIE_Image_EDIT"
+    }
+  }
+}

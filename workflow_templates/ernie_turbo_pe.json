@@ -1,0 +1,125 @@
+{
+  "_meta": {
+    "name": "ERNIE-Image Turbo T2I + PE",
+    "description": "ERNIE-Image Turbo 文生图（8 步）+ Prompt Enhancer（Ministral3 PE 增强提示词）。使用标准 ComfyUI 节点：CLIPLoader(type=flux2) + TextGenerate + CLIPTextEncode",
+    "variant": "ernie-image-turbo-gguf-q4-k-m",
+    "default_steps": 8,
+    "default_guidance": 1.0,
+    "supports_pe": true,
+    "placeholders": {
+      "__PROMPT__": "正向提示词（PE 增强前的原始提示词，必填）",
+      "__NEGATIVE_PROMPT__": "负向提示词（默认空）",
+      "__WIDTH__": "宽度（8 的倍数，默认 1024）",
+      "__HEIGHT__": "高度（8 的倍数，默认 1024）",
+      "__STEPS__": "推理步数（默认 8）",
+      "__CFG__": "引导系数（默认 1.0）",
+      "__SEED__": "随机种子（默认 0=随机）",
+      "__GGUF_FILENAME__": "GGUF 主权重文件名",
+      "__VAE_FILENAME__": "VAE 文件名",
+      "__TEXT_ENCODER_FILENAME__": "Text Encoder 文件名",
+      "__PE_FILENAME__": "PE 权重文件名（含 tekken_model 的 model_with_tokenizer.safetensors）",
+      "__PE_PROMPT__": "PE 系统提示词（engine.py 构建，含 <s>[SYSTEM_PROMPT]...[/INST] 模板）"
+    },
+    "notes": [
+      "PE（Prompt Enhancer）基于 Ministral3 模型，用 CLIPLoader(type=flux2) 加载",
+      "TextGenerate 节点执行 LLM 推理生成增强 prompt",
+      "PE 系统提示词模板在 engine.py 中构建，替换 {prompt}/{width}/{height} 后传入 TextGenerate",
+      "use_default_template=false：跳过 ComfyUI 默认模板，使用我们构建的完整 <s>[SYSTEM_PROMPT] 模板",
+      "若 PE 模型缺少 tekken_model 键，Mistral3Tokenizer 初始化会报 TypeError"
+    ]
+  },
+  "1": {
+    "class_type": "UnetLoaderGGUF",
+    "inputs": {
+      "unet_name": "__GGUF_FILENAME__"
+    }
+  },
+  "2": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "__TEXT_ENCODER_FILENAME__",
+      "type": "flux2"
+    }
+  },
+  "10": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "__PE_FILENAME__",
+      "type": "flux2"
+    }
+  },
+  "11": {
+    "class_type": "TextGenerate",
+    "inputs": {
+      "clip": ["10", 0],
+      "prompt": "__PE_PROMPT__",
+      "max_length": 2048,
+      "sampling_mode": "on",
+      "sampling_mode.temperature": 0.6,
+      "sampling_mode.top_k": 64,
+      "sampling_mode.top_p": 0.8,
+      "sampling_mode.min_p": 0.05,
+      "sampling_mode.repetition_penalty": 1.05,
+      "sampling_mode.seed": 0,
+      "thinking": false,
+      "use_default_template": false
+    }
+  },
+  "3": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": ["11", 0],
+      "clip": ["2", 0]
+    }
+  },
+  "4": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "__NEGATIVE_PROMPT__",
+      "clip": ["2", 0]
+    }
+  },
+  "5": {
+    "class_type": "EmptyFlux2LatentImage",
+    "inputs": {
+      "width": "__WIDTH__",
+      "height": "__HEIGHT__",
+      "batch_size": 1
+    }
+  },
+  "6": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model": ["1", 0],
+      "positive": ["3", 0],
+      "negative": ["4", 0],
+      "latent_image": ["5", 0],
+      "seed": "__SEED__",
+      "steps": "__STEPS__",
+      "cfg": "__CFG__",
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1.0
+    }
+  },
+  "7": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "__VAE_FILENAME__"
+    }
+  },
+  "8": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": ["6", 0],
+      "vae": ["7", 0]
+    }
+  },
+  "9": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": ["8", 0],
+      "filename_prefix": "ERNIE_Image_PE"
+    }
+  }
+}
