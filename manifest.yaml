@@ -1,6 +1,6 @@
 engine_id: ernie_image_909469ed
 engine_name: ERNIE-Image (ComfyUI)
-engine_version: 0.3.0
+engine_version: 1.0.0
 aireliable_compat: '>=0.0.16'
 uv_env_name: image-ernie-comfyui
 export_mode: source
@@ -40,8 +40,8 @@ source:
   type: github
   github_repo: PaddlePaddle/ERNIE-Image
 upgrade:
-  check_url: https://api.github.com/repos/PaddlePaddle/ERNIE-Image/releases/latest
-  auto_check: false
+  check_url: https://api.github.com/repos/AIJianGe/aireliable-engine-ernie-image/releases/latest
+  auto_check: true
 node_packages: []
 extra:
   custom_node_dependencies: []
@@ -56,10 +56,10 @@ env_config:
   requires_python: '>=3.10,<3.12'
   notes: 'ComfyUI v0.32.0 需要 torch 2.7+，ERNIE-Image 通过 ComfyUI-GGUF 扩展加载'
   recommended_versions:
-    torch: '2.13.0'
-    torchvision: '0.28.0'
+    torch: '2.11.0'
+    torchvision: '0.26.0'
     torchaudio: null
-    reason: 'ComfyUI v0.32.0 + ComfyUI-GGUF（Randy420Marsh fork）测试通过的稳定版本组合'
+    reason: 'cu128 索引无 2.13.0 构建（仅 PyPI 的 CPU 版），与 default_cuda_version=cu128 对齐取 2.11.0+cu128；ComfyUI v0.32.0 要求 torch>=2.7.0，2.11.0 满足'
 
 models:
   model_layout:
