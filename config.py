@@ -31,6 +31,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from aireliable_engine import EngineConfig as BaseEngineConfig
+
 
 # ===== 常量 =====
 
@@ -100,25 +102,18 @@ DEVICE_POLICIES = ("auto", "gpu", "gpu+cpu", "cpu")
 
 
 @dataclass
-class EngineConfig:
+class EngineConfig(BaseEngineConfig):
     """引擎运行配置（v0.3.0 ComfyUI 子进程模式）。
 
     通过环境变量 + 命令行参数构造。
     """
 
-    # ===== 基础 =====
+    # ===== 基础（身份 / 端口默认值由本引擎覆盖，其余公共字段见基类）=====
     engine_id: str = ENGINE_ID
     engine_name: str = ENGINE_NAME
     capability: str = CAPABILITY
     engine_type: str = ENGINE_TYPE
     port: int = DEFAULT_PORT
-    host: str = "127.0.0.1"
-
-    # ===== 路径 =====
-    models_root: Path = Path("models")               # 模型根目录（AIRELIABLE_MODELS_ROOT）
-    project_root: Path = Path(".")                   # 项目根
-    # v0.2.5+ 输出文件根目录统一为 output（项目顶层目录）
-    output_root: Path = Path("output")
 
     # ===== 推导路径（模型）=====
     unet_dir: Path = field(init=False)               # GGUF 主权重目录
@@ -172,13 +167,7 @@ class EngineConfig:
     # 平台通过 AIRELIABLE_DEVICE_POLICY 环境变量注入（UI 设置 > 默认 auto），
     # 映射到 vram_mode（gpu→highvram / gpu+cpu→lowvram / cpu→cpu），
     # 仅当用户未显式配置 vram_mode（--vram-mode / COMFYUI_VRAM_MODE）时生效。
-    device_policy: str = "auto"
-
-    # ===== 平台 Core URL（用于显存上报 / LRU 协调）=====
-    core_url: Optional[str] = None
-
-    # ===== 日志级别 =====
-    log_level: str = "INFO"
+    # 默认 "auto" 由基类 EngineConfig 提供。
 
     def __post_init__(self) -> None:
         """推导子路径。"""

@@ -1,0 +1,45 @@
+# 开源引擎中心展示元数据（任务 80 / T4.1）
+# 只供 OSS catalog 发布使用，不属于 manifest 规范，不影响引擎加载。
+schema: 1
+engine_id: ernie_image_909469ed
+
+name:
+  zh: "ERNIE 图像生成"
+  en: "ERNIE-Image (ComfyUI)"
+
+description:
+  zh: "ERNIE-Image 文生图引擎，基于 ComfyUI 子进程运行，提供 GGUF Q4 与 Turbo 加速两档模型。"
+  en: "ERNIE-Image text-to-image engine running on a ComfyUI subprocess, with GGUF Q4 and Turbo variants."
+
+category: image
+tags:
+  - text-to-image
+  - comfyui
+  - ernie
+
+repository:
+  github: AIJianGe/aireliable-engine-ernie-image
+  gitee: AIJianGe/aireliable-engine-ernie-image
+
+cover: catalog/covers/ernie_image_909469ed.webp
+
+requirements:
+  python: ">=3.10,<3.13"
+  torch: ">=2.5.0"
+  gpu: required
+
+license: PolyForm-Noncommercial-1.0.0
+
+description_long:
+  zh: |-
+    ERNIE-Image 通过 ComfyUI 子进程承载推理，再由 AIReliable 统一封装为标准的图像生成引擎，对外接口与其他图像引擎一致。
+
+    目录提供 GGUF Q4 与 Turbo 两档：Q4 显存占用更低、适合中低显存设备；Turbo 用更少的采样步数换取更快的出图，适合草图与批量试色。
+
+    引擎负责 ComfyUI 进程的启动、端口分配、任务排队与异常重启，用户无需单独维护 ComfyUI 环境。建议使用 NVIDIA GPU 并预留充足显存。
+  en: |-
+    ERNIE-Image runs inference inside a ComfyUI subprocess and is wrapped by AIReliable as a standard image-generation engine, so its API matches the other image engines.
+
+    Two tiers are offered: GGUF Q4 lowers VRAM usage for mid-range cards, while Turbo trades sampling steps for faster output and suits drafts and batch colour exploration.
+
+    The engine manages the ComfyUI process lifecycle, port assignment, task queuing and restart-on-failure, so no separate ComfyUI environment is needed. An NVIDIA GPU with sufficient VRAM is recommended.

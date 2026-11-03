@@ -1,6 +1,7 @@
 """ERNIE-Image 引擎 HTTP 服务（v0.3.0 ComfyUI 子进程模式 + 反代 ComfyUI Web UI）。
 
-实现 8 个标准 HTTP 端点 + 反向代理 ComfyUI 自带 Web UI（用于调试和高级用户）。
+8 个标准端点 / CORS / 日志端点 / 静态挂载由 SDK 骨架（``build_engine_app``）
+提供；本文件保留引擎特有路由（``/load`` 的 GPU/模型错误映射 + ComfyUI 反代）。
 
 启动：
     uv run --no-sync --project envs/image-ernie-comfyui \\
@@ -18,15 +19,10 @@
     GET  /output/*       静态文件（生成的图片）
     ANY  /{path}         反向代理 → ComfyUI Web UI（最后挂载）
 
-v0.3.0 关键变更（与 v0.2 范式 B 的差异）：
-    - 删除 Gradio UI 挂载（v0.2 遗留）
-    - 删除 SDK workflow / node 路由挂载（v0.2 范式 B 遗留）
-    - 删除 file routes / workflow editor UI 挂载（v0.2 范式 B 遗留）
-    - 删除 _component_load_status 注入（v0.2 范式 B 遗留，v0.3 通过 StatusResponse.extra 返回）
-    - 新增 _mount_comfyui_proxy：反向代理 ComfyUI Web UI（catch-all，最后挂载）
-    - 反代支持 SSE 流式透传 + WebSocket 透传（ComfyUI WS 用于实时预览图推送）
-    - 未 /load 时反代返回友好 HTML 提示页（503）
-    - 新增 auto_load_if_needed helper（状态机恢复 + ComfyUI 子进程启动）
+为什么 ``/load`` 由本文件自实现（``skip_endpoints=["/load"]``）：
+    本引擎需要把「模型文件缺失」映射为 503 ``model_not_ready``、
+    把「CUDA OOM / 子进程启动失败」映射为 503 ``subprocess_failed``，
+    与骨架通用的 404/400/500 口径不同，故跳过骨架端点、在本文件实现。
 
 参考实现：``engines/llama_cpp_9cdb76f8/server.py``
 """
@@ -36,31 +32,19 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Optional
 
-import json as _json
-
 import httpx
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import (
-    HTMLResponse,
-    JSONResponse,
-    StreamingResponse,
-)
-from fastapi.staticfiles import StaticFiles
+from fastapi import APIRouter, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from aireliable_engine import (
     ErrorResponse,
-    HealthResponse,
-    InferRequest,
     LoadRequest,
-    LoraLoadRequest,
-    LoraUnloadRequest,
     RuntimeState,
-    register_log_level_endpoint,
-    setup_engine_logging,
+    build_engine_app,
+    run_engine_server,
 )
 
 from .config import EngineConfig, parse_args
@@ -70,7 +54,7 @@ logger = logging.getLogger(__name__)
 
 
 # ===== 全局引擎实例 =====
-# FastAPI 启动时初始化，所有端点共享
+# 由 SDK 骨架的 startup_hook 绑定，供本文件的路由使用
 _engine: Optional[ErnieImageEngine] = None
 _config: Optional[EngineConfig] = None
 # v0.3.9+ 全局复用 AsyncClient（避免每次反代请求新建连接池，5.8MB 文件从 14s 降到 <0.5s）
@@ -144,45 +128,24 @@ def _setup_asyncio_noise_filter() -> None:
     logger.debug("已设置 asyncio 噪声过滤器（过滤 WinError 10054）")
 
 
-# ===== Lifespan 生命周期管理 =====
+# ===== Lifespan 钩子（由 SDK 骨架调用）=====
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """FastAPI 生命周期管理。
+async def _on_startup(engine: ErnieImageEngine) -> None:
+    """启动钩子：绑定全局实例 + 装噪声过滤器 + 初始化反代连接池。"""
+    global _engine, _proxy_client
 
-    启动时初始化引擎，关闭时清理资源（停止 ComfyUI 子进程 + 关闭 vram_manager）。
-    """
-    global _engine, _config
-
-    # 解析配置（如果尚未从命令行注入）
-    if _config is None:
-        _config = parse_args()
-
-    # 配置日志
-    setup_engine_logging(
-        engine_id=_config.engine_id,
-        log_level=_config.log_level,
-        log_dir=_config.log_dir,
-    )
-
+    _engine = engine
     # v0.3.1+ 设置自定义异常处理器
     _setup_asyncio_noise_filter()
-
-    logger.info("===== ERNIE-Image 引擎启动（v0.3.0 ComfyUI 子进程模式）=====")
-    logger.info("配置: %s", _config.to_dict())
-
-    # 初始化引擎
-    _engine = ErnieImageEngine(_config)
     logger.info(
         "引擎实例化完成: state=%s, variants=%d, available=%d, loras=%d",
-        _engine.state_machine.state.value,
-        len(_engine._manifest_variants),
-        len(_engine._available_variants),
-        len(_engine._available_loras),
+        engine.state_machine.state.value,
+        len(engine._manifest_variants),
+        len(engine._available_variants),
+        len(engine._available_loras),
     )
 
     # v0.3.9+ 初始化全局反代 AsyncClient（连接池复用，避免每次请求新建）
-    global _proxy_client
     _proxy_client = httpx.AsyncClient(
         timeout=httpx.Timeout(600.0, connect=10.0),
         follow_redirects=False,
@@ -191,258 +154,86 @@ async def lifespan(app: FastAPI):
     )
     logger.info("全局反代 AsyncClient 已初始化（连接池: max=100, keepalive=20）")
 
-    yield
 
-    # 关闭清理：停止 ComfyUI 子进程 + 关闭 PlatformVramManager + 关闭反代 client
+async def _on_shutdown(engine: ErnieImageEngine) -> None:
+    """关闭钩子：关闭反代 client + 停止 ComfyUI 子进程 + 清空全局引用。"""
+    global _engine, _config, _proxy_client
+
     logger.info("===== ERNIE-Image 引擎关闭 =====")
-    if _proxy_client is not None:
+    try:
+        if _proxy_client is not None:
+            try:
+                await _proxy_client.aclose()
+            except Exception as e:
+                logger.warning("关闭反代 AsyncClient 失败: %s", e)
+            _proxy_client = None
         try:
-            await _proxy_client.aclose()
-        except Exception as e:
-            logger.warning("关闭反代 AsyncClient 失败: %s", e)
-        _proxy_client = None
-    if _engine is not None:
-        try:
-            await _engine.shutdown()
+            await engine.shutdown()
         except Exception as e:
             logger.warning("关闭时清理资源失败: %s", e)
-    _engine = None
+    finally:
+        _engine = None
+        _config = None
 
 
-# ===== 创建 FastAPI 应用 =====
+# ===== 引擎特有路由 =====
 
-def create_app(config: EngineConfig | None = None) -> FastAPI:
-    """创建 FastAPI 应用。
+router = APIRouter()
 
-    Args:
-        config: 引擎配置（None 则从命令行解析）
 
-    Returns:
-        FastAPI: 配置好的应用实例
+@router.post("/load")
+async def load(request: LoadRequest) -> dict:
+    """启动 ComfyUI 子进程（若未启动）+ 显存上报 L3。
+
+    ComfyUI 子进程启动后不预加载模型（模型在首次推理时由 ComfyUI 自动加载）。
+    错误口径与迁移前一致：
+        - 模型文件缺失 → 503 ``model_not_ready``（fail fast）
+        - GPU 资源不足（OOM 等）/ 子进程启动失败 → 503 ``subprocess_failed``
+        - 档位名非法 → 400；其他 → 500
     """
-    global _config
-    if config is not None:
-        _config = config
-
-    app = FastAPI(
-        title="ERNIE-Image Engine",
-        description=(
-            "AIReliable 平台的 ERNIE-Image 引擎（v0.3.0 ComfyUI 子进程模式 + 反代 ComfyUI UI）"
-        ),
-        version="0.3.0",
-        lifespan=lifespan,
-    )
-
-    # CORS（允许主控跨域调用，iframe 嵌入需要）
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],                  # v0.1 简化，生产环境应限制
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
-    # ===== 注册 8 个标准端点 + /output 静态挂载 =====
-    _register_endpoints(app)
-    _mount_output_static(app)
-
-    # ===== 反向代理 ComfyUI UI（必须最后挂载）=====
-    # 注意：反代路由使用 catch-all /{path:path}，会拦截未匹配的所有路径，
-    # 因此必须在 8 端点 + /output 之后挂载，否则会拦截 /health /load 等关键端点
-    _mount_comfyui_proxy(app)
-
-    return app
-
-
-# ===== 8 端点注册 =====
-
-def _register_endpoints(app: FastAPI) -> None:
-    """注册 8 个标准 HTTP 端点。"""
-
-    # 1. /health
-    @app.get("/health", response_model=HealthResponse)
-    async def health() -> HealthResponse:
-        """健康检查（v0.2.3 D9.1：快速返回 < 100ms，避免 health_check_timeout）。
-
-        - 引擎正在加载（state=loading）→ 立即返回 503 + ``{"status": "loading"}``
-        - 其他状态（idle/ready/inferring/error）→ 立即返回 200 + ``{"status": "healthy"}``
-        """
-        engine = get_engine()
-        return await engine.health()
-
-    # 2. /capabilities
-    @app.get("/capabilities")
-    async def capabilities() -> dict:
-        """能力声明（可用 variant 列表 + LoRA 列表 + 支持的分辨率）。
-
-        注意：手动序列化 variants 以保留 ErnieVariantInfo 扩展字段
-        （path / file_size），避免 Pydantic 按基类 VariantInfo 序列化时丢弃子类字段。
-        """
-        resp = await get_engine().capabilities()
-        data = resp.model_dump()
-        data["variants"] = [v.model_dump() for v in resp.variants]
-        return data
-
-    # 3. /load
-    @app.post("/load")
-    async def load(request: LoadRequest) -> dict:
-        """启动 ComfyUI 子进程（若未启动）+ 显存上报 L3。
-
-        ComfyUI 子进程启动后不预加载模型（模型在首次推理时由 ComfyUI 自动加载）。
-        """
-        try:
-            response = await get_engine().load(request)
-            return response.model_dump()
-        except FileNotFoundError as e:
-            # 模型文件缺失，返回 503 + error_type=model_not_ready（fail fast）
+    try:
+        response = await get_engine().load(request)
+        return response.model_dump()
+    except FileNotFoundError as e:
+        # 模型文件缺失，返回 503 + error_type=model_not_ready（fail fast）
+        return JSONResponse(
+            status_code=503,
+            content=ErrorResponse(error={
+                "type": "model_not_ready",
+                "message": str(e),
+                "code": 503,
+            }).model_dump(),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        # GPU 资源不足（CUDA OOM）/ 子进程启动失败
+        msg = str(e).lower()
+        gpu_error_keywords = (
+            "cuda out of memory",
+            "out of memory",
+            "cuda error",
+            "cudnn",
+            "rocm",
+            "hip out of memory",
+            "device-side assert",
+        )
+        if any(kw in msg for kw in gpu_error_keywords):
+            logger.error("GPU 资源不足，加载失败: %s", e)
             return JSONResponse(
                 status_code=503,
                 content=ErrorResponse(error={
-                    "type": "model_not_ready",
-                    "message": str(e),
+                    "type": "subprocess_failed",
+                    "message": f"GPU 资源不足: {e}",
                     "code": 503,
                 }).model_dump(),
             )
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-        except RuntimeError as e:
-            # GPU 资源不足（CUDA OOM）/ 子进程启动失败
-            msg = str(e).lower()
-            gpu_error_keywords = (
-                "cuda out of memory",
-                "out of memory",
-                "cuda error",
-                "cudnn",
-                "rocm",
-                "hip out of memory",
-                "device-side assert",
-            )
-            if any(kw in msg for kw in gpu_error_keywords):
-                logger.error("GPU 资源不足，加载失败: %s", e)
-                return JSONResponse(
-                    status_code=503,
-                    content=ErrorResponse(error={
-                        "type": "subprocess_failed",
-                        "message": f"GPU 资源不足: {e}",
-                        "code": 503,
-                    }).model_dump(),
-                )
-            # 其他 RuntimeError 走通用 500 错误
-            logger.exception("加载失败（RuntimeError）")
-            raise HTTPException(status_code=500, detail=str(e))
-        except Exception as e:
-            logger.exception("加载失败")
-            raise HTTPException(status_code=500, detail=str(e))
-
-    # 4. /unload
-    @app.post("/unload")
-    async def unload() -> dict:
-        """释放 ComfyUI 显存（调 /free，L4 LRU 响应）或停止子进程。"""
-        try:
-            response = await get_engine().unload()
-            return response.model_dump()
-        except Exception as e:
-            logger.exception("卸载失败")
-            raise HTTPException(status_code=500, detail=str(e))
-
-    # 5. /infer（SSE 流式）
-    @app.post("/infer")
-    async def infer(request: InferRequest):
-        """推理（SSE 流式返回进度）。
-
-        请求体参考 InferRequest schema：
-            - variant: 可选，若未加载则自动调 /load
-            - inputs.prompt: 正向提示词（必填）
-            - inputs.negative_prompt: 负向提示词（默认空）
-            - inputs.size: 图片尺寸，如 "1024x1024"（默认 1024x1024）
-            - inputs.num_inference_steps: 推理步数（默认 8 for Turbo, 50 for Base）
-            - inputs.guidance_scale: 引导系数（默认 1.0 for Turbo, 5.0 for Base）
-            - inputs.seed: 随机种子（默认 0=随机）
-            - inputs.use_pe: 是否启用 Prompt Enhancer（默认 false）
-            - loras: LoRA 列表（可选）
-            - task_id: 可选任务 ID
-
-        返回 SSE 流，事件类型：
-            - progress: 推理进度（含 stage / step / total_steps）
-            - error: 错误（含 error_type）
-            - final: 最终结果（含 images / image_urls / timing）
-        """
-        engine = get_engine()
-
-        # BaseEngine.infer 返回异步迭代器（SSE 帧）
-        sse_stream = engine.infer(request)
-
-        return StreamingResponse(
-            sse_stream,
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",          # Nginx 不缓冲
-            },
-        )
-
-    # 6. /status
-    @app.get("/status")
-    async def status() -> dict:
-        """引擎状态查询（含 ComfyUI 子进程状态 + 显存占用）。"""
-        return (await get_engine().status()).model_dump()
-
-    # 7. /lora/load
-    @app.post("/lora/load")
-    async def lora_load(request: LoraLoadRequest) -> dict:
-        """记录已加载的 LoRA（运行时通过工作流模板注入 LoraLoader 节点）。"""
-        try:
-            response = await get_engine().load_lora(request)
-            return response.model_dump()
-        except FileNotFoundError as e:
-            raise HTTPException(status_code=404, detail=str(e))
-        except Exception as e:
-            logger.exception("LoRA 加载失败")
-            raise HTTPException(status_code=500, detail=str(e))
-
-    # 8. /lora/unload
-    @app.post("/lora/unload")
-    async def lora_unload(request: LoraUnloadRequest) -> dict:
-        """从 loaded_loras 移除指定 LoRA。"""
-        try:
-            response = await get_engine().unload_lora(request)
-            return response.model_dump()
-        except Exception as e:
-            logger.exception("LoRA 卸载失败")
-            raise HTTPException(status_code=500, detail=str(e))
-
-    # 错误处理
-    @app.exception_handler(HTTPException)
-    async def http_exception_handler(request: Request, exc: HTTPException):
-        """HTTP 异常统一格式。"""
-        return JSONResponse(
-            status_code=exc.status_code,
-            content=ErrorResponse(error={
-                "type": exc.__class__.__name__,
-                "message": str(exc.detail),
-                "code": exc.status_code,
-            }).model_dump(),
-        )
-
-    # v0.2.5+ T6.2：日志级别动态调整端点（GET /log_level + POST /log_level）
-    register_log_level_endpoint(app)
-
-
-# ===== /output 静态挂载 =====
-
-def _mount_output_static(app: FastAPI) -> None:
-    """挂载 /output/* 静态文件（生成的图片下载）。"""
-    if _config is None:
-        return
-    # 确保 output_root 存在
-    _config.output_root.mkdir(parents=True, exist_ok=True)
-    app.mount(
-        "/output",
-        StaticFiles(directory=str(_config.output_root)),
-        name="output",
-    )
-    logger.info("输出目录挂载: /output -> %s", _config.output_root)
+        # 其他 RuntimeError 走通用 500 错误
+        logger.exception("加载失败（RuntimeError）")
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        logger.exception("加载失败")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ===== 状态机恢复 + auto-load 公共 helper（v0.3.7+）=====
@@ -590,321 +381,302 @@ _UNREADY_HTML = """<!DOCTYPE html>
 """
 
 
-def _mount_comfyui_proxy(app: FastAPI) -> None:
-    """挂载反向代理路由到 ComfyUI 自带 Web UI。
+async def _ensure_subprocess_running() -> Optional[HTMLResponse]:
+    """确保 ComfyUI 子进程已启动（反代路由 auto-load 辅助函数）。
 
-    v0.3.0 关键设计：
-        - catch-all 路由 /{path:path}，必须最后挂载（在 8 端点 + /output 之后）
-        - 支持 HTTP 方法：GET / POST / PUT / DELETE / OPTIONS / PATCH / HEAD
-        - 支持 SSE 流式透传（ComfyUI /prompt 提交后通过 WS 推送进度，
-          但 /api/ 部分接口可能用 SSE）
-        - 支持 WebSocket 透传（ComfyUI /ws 端点用于实时事件推送 + 预览图）
-        - 未 /load 时返回友好 HTML 提示页（503）
-        - 排除已注册的 8 端点 + /output + /openapi.json + /docs
+    v0.3.0 语义：
+        - 用户访问 UI 时自动启动 ComfyUI 子进程（不预加载模型）
+        - 模型在首次推理时由 ComfyUI 自动加载
+        - 行为对齐 llama_cpp 的 auto-load 逻辑
 
-    透传策略：
-        - 请求：透传 method / path / query / headers / body
-        - 响应：透传 status_code / headers / body（流式）
-        - 跳过 hop-by-hop headers（host / content-length / transfer-encoding 等）
+    v0.3.7+：委托给统一的 auto_load_if_needed helper（含状态机恢复），
+    避免子进程死了但状态机卡在 READY 时直接 load 触发非法转换。
 
-    注意：本函数仅声明闭包路由处理器，不立即访问 _engine / process_manager。
-    路由处理器在请求到达时才调用 get_engine()，此时 lifespan 已初始化引擎。
+    若子进程已运行，返回 None（继续反代）。
+    若子进程未运行，自动调 load(variant=None) 启动；
+      - 启动成功返回 None（继续反代）
+      - 启动失败返回 503 HTMLResponse（显示错误提示页）
     """
+    engine = get_engine()
+    try:
+        await auto_load_if_needed(engine)
+        return None
+    except Exception as e:
+        logger.exception("反代 auto-load 失败：%s", e)
+        err_html = _UNREADY_HTML.replace(
+            "请先在平台详情页点击 启动 按钮（调 POST /load）。",
+            f"自动启动失败：{e}<br><br>请检查 ComfyUI 目录和模型文件是否完整，或手动调 POST /load。",
+        )
+        return HTMLResponse(content=err_html, status_code=503)
 
-    # ===== HTTP 反向代理 =====
-    async def _ensure_subprocess_running() -> Optional[HTMLResponse]:
-        """确保 ComfyUI 子进程已启动（反代路由 auto-load 辅助函数）。
 
-        v0.3.0 语义：
-            - 用户访问 UI 时自动启动 ComfyUI 子进程（不预加载模型）
-            - 模型在首次推理时由 ComfyUI 自动加载
-            - 行为对齐 llama_cpp 的 auto-load 逻辑
+@router.api_route(
+    "/{path:path}",
+    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH", "HEAD"],
+)
+async def reverse_proxy(path: str, request: Request):
+    """反向代理到 ComfyUI 内部端口。
 
-        v0.3.7+：委托给统一的 auto_load_if_needed helper（含状态机恢复），
-        避免子进程死了但状态机卡在 READY 时直接 load 触发非法转换。
+    v0.3.0：子进程未启动时自动调 load（auto-load），
+    而非返回 503 提示页。对齐 llama_cpp 的 UI auto-load 规范。
 
-        若子进程已运行，返回 None（继续反代）。
-        若子进程未运行，自动调 _load_impl(variant=None) 启动；
-          - 启动成功返回 None（继续反代）
-          - 启动失败返回 503 HTMLResponse（显示错误提示页）
-        """
-        engine = get_engine()
-        try:
-            await auto_load_if_needed(engine)
-            return None
-        except Exception as e:
-            logger.exception("反代 auto-load 失败：%s", e)
-            err_html = _UNREADY_HTML.replace(
-                "请先在平台详情页点击 启动 按钮（调 POST /load）。",
-                f"自动启动失败：{e}<br><br>请检查 ComfyUI 目录和模型文件是否完整，或手动调 POST /load。",
-            )
-            return HTMLResponse(content=err_html, status_code=503)
+    Args:
+        path: 路径（不含前导 /，如 "prompt" / "history" / "view" / "api"）
+        request: FastAPI Request 对象
+    """
+    # 排除 OpenAPI / Swagger UI 路径（FastAPI 自带，但 catch-all 会拦截）
+    if path in ("openapi.json", "docs", "redoc"):
+        raise HTTPException(status_code=404, detail=f"未找到路径: /{path}")
 
-    @app.api_route(
-        "/{path:path}",
-        methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH", "HEAD"],
-    )
-    async def reverse_proxy(path: str, request: Request):
-        """反向代理到 ComfyUI 内部端口。
+    # auto-load：子进程未启动时自动启动
+    err = await _ensure_subprocess_running()
+    if err is not None:
+        return err
 
-        v0.3.0：子进程未启动时自动调 _load_impl（auto-load），
-        而非返回 503 提示页。对齐 llama_cpp 的 UI auto-load 规范。
+    engine = get_engine()
+    pm_local = engine._process_manager
 
-        Args:
-            path: 路径（不含前导 /，如 "prompt" / "history" / "view" / "api"）
-            request: FastAPI Request 对象
-        """
-        # 排除 OpenAPI / Swagger UI 路径（FastAPI 自带，但 catch-all 会拦截）
-        if path in ("openapi.json", "docs", "redoc"):
-            raise HTTPException(status_code=404, detail=f"未找到路径: /{path}")
+    # 构造转发请求
+    # v0.4.3 修复：使用 ASGI raw_path（原始未解码路径）构造转发 URL。
+    # 原因：FastAPI {path:path} 参数已解码（%2F → /），f"{url}/{path}" 再经
+    # httpx 发送时 / 不会被重新编码为 %2F。ComfyUI 前端请求 userdata 子目录
+    # 文件时用 %2F 编码斜杠（绕过 aiohttp /userdata/{file} 路由中 {file}
+    # 不匹配 / 的限制），经反代解码后 → ComfyUI 路由不匹配 → 404
+    # （症状：Web UI 侧边栏双击打开 ERNIE-Image 子目录工作流报
+    #  "Failed to load file ... 404 Not Found"，目录列表正常但单文件 404）。
+    # raw_path 保留浏览器原始编码（%2F / 中文 UTF-8），转发后 ComfyUI
+    # 行为与浏览器直连一致（已实测：直连 200，旧反代 404）。
+    raw_path_bytes = request.scope.get("raw_path")
+    if raw_path_bytes:
+        # 原始百分号编码均为 ASCII，安全 decode
+        forward_path = raw_path_bytes.decode("ascii", errors="backslashreplace")
+    else:
+        # fallback：raw_path 缺失时对已解码 path 重新编码（/ 保留）
+        from urllib.parse import quote
+        forward_path = quote("/" + path, safe="/%")
+    target_url = f"{pm_local.internal_url}{forward_path}"
+    if request.url.query:
+        target_url = f"{target_url}?{request.url.query}"
 
-        # auto-load：子进程未启动时自动启动
-        err = await _ensure_subprocess_running()
-        if err is not None:
-            return err
+    # 透传请求头（移除 hop-by-hop headers）
+    forward_headers = _strip_hop_by_hop_headers(dict(request.headers))
 
-        engine = get_engine()
-        pm_local = engine._process_manager
+    # ComfyUI origin_only_middleware 兼容（v0.3.8 修复 Web UI 403 问题）：
+    # ComfyUI 会拒绝两类请求（返回 403）：
+    #   1) Host 与 Origin 域名不匹配（防跨站 POST 劫持）
+    #   2) Sec-Fetch-Site: cross-site
+    # 反代场景下 Host 被 httpx 重写为内部地址（127.0.0.1:8100），而浏览器
+    # 的 Origin（http://127.0.0.1:7001）被原样转发 → 触发不匹配 → 403。
+    # module script / modulepreload 请求（<script type="module">、
+    # <link rel="modulepreload">）以 CORS 模式发送、必带 Origin 头，
+    # 普通 CSS / fetch / 导航请求不带，因此仅 JS 资源全部 403，
+    # 页面停在 logo 加载界面。
+    # 修复：移除 Origin / Referer / Sec-Fetch-* 头，让 ComfyUI 视为本地请求。
+    for _h in ("origin", "referer", "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest"):
+        forward_headers.pop(_h, None)
 
-        # 构造转发请求
-        # v0.4.3 修复：使用 ASGI raw_path（原始未解码路径）构造转发 URL。
-        # 原因：FastAPI {path:path} 参数已解码（%2F → /），f"{url}/{path}" 再经
-        # httpx 发送时 / 不会被重新编码为 %2F。ComfyUI 前端请求 userdata 子目录
-        # 文件时用 %2F 编码斜杠（绕过 aiohttp /userdata/{file} 路由中 {file}
-        # 不匹配 / 的限制），经反代解码后 → ComfyUI 路由不匹配 → 404
-        # （症状：Web UI 侧边栏双击打开 ERNIE-Image 子目录工作流报
-        #  "Failed to load file ... 404 Not Found"，目录列表正常但单文件 404）。
-        # raw_path 保留浏览器原始编码（%2F / 中文 UTF-8），转发后 ComfyUI
-        # 行为与浏览器直连一致（已实测：直连 200，旧反代 404）。
-        raw_path_bytes = request.scope.get("raw_path")
-        if raw_path_bytes:
-            # 原始百分号编码均为 ASCII，安全 decode
-            forward_path = raw_path_bytes.decode("ascii", errors="backslashreplace")
-        else:
-            # fallback：raw_path 缺失时对已解码 path 重新编码（/ 保留）
-            from urllib.parse import quote
-            forward_path = quote("/" + path, safe="/%")
-        target_url = f"{pm_local.internal_url}{forward_path}"
-        if request.url.query:
-            target_url = f"{target_url}?{request.url.query}"
+    # v0.3.9 性能修复：禁用上游压缩 + 大 chunk 流式
+    # 原因：aiter_bytes() 默认 1KB chunk，5.8MB JS 文件需 5800+ 次 yield/await，
+    #       实测反代 14.2s vs 直连 0.15s（慢 90 倍）。
+    # 修复：
+    #   1. Accept-Encoding: identity → ComfyUI 不压缩，返回原始字节
+    #   2. aiter_raw(chunk_size=65536) → 64KB chunk，5.8MB 只需 ~90 次 yield
+    #   3. 由于未压缩，无需移除 content-encoding（保持透传一致性）
+    forward_headers["accept-encoding"] = "identity"
 
-        # 透传请求头（移除 hop-by-hop headers）
-        forward_headers = _strip_hop_by_hop_headers(dict(request.headers))
+    # 读取请求体
+    body = await request.body()
 
-        # ComfyUI origin_only_middleware 兼容（v0.3.8 修复 Web UI 403 问题）：
-        # ComfyUI 会拒绝两类请求（返回 403）：
-        #   1) Host 与 Origin 域名不匹配（防跨站 POST 劫持）
-        #   2) Sec-Fetch-Site: cross-site
-        # 反代场景下 Host 被 httpx 重写为内部地址（127.0.0.1:8100），而浏览器
-        # 的 Origin（http://127.0.0.1:7001）被原样转发 → 触发不匹配 → 403。
-        # module script / modulepreload 请求（<script type="module">、
-        # <link rel="modulepreload">）以 CORS 模式发送、必带 Origin 头，
-        # 普通 CSS / fetch / 导航请求不带，因此仅 JS 资源全部 403，
-        # 页面停在 logo 加载界面。
-        # 修复：移除 Origin / Referer / Sec-Fetch-* 头，让 ComfyUI 视为本地请求。
-        for _h in ("origin", "referer", "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest"):
-            forward_headers.pop(_h, None)
+    logger.debug("反代转发: %s %s -> %s", request.method, path, target_url)
 
-        # v0.3.9 性能修复：禁用上游压缩 + 大 chunk 流式
-        # 原因：aiter_bytes() 默认 1KB chunk，5.8MB JS 文件需 5800+ 次 yield/await，
-        #       实测反代 14.2s vs 直连 0.15s（慢 90 倍）。
-        # 修复：
-        #   1. Accept-Encoding: identity → ComfyUI 不压缩，返回原始字节
-        #   2. aiter_raw(chunk_size=65536) → 64KB chunk，5.8MB 只需 ~90 次 yield
-        #   3. 由于未压缩，无需移除 content-encoding（保持透传一致性）
-        forward_headers["accept-encoding"] = "identity"
+    # v0.3.9+ 使用全局复用 AsyncClient（连接池 + keepalive，避免每次请求新建）
+    global _proxy_client
+    client = _proxy_client
+    if client is None:
+        # 兜底：lifespan 未初始化时（不应发生）回退到临时 client
+        client = httpx.AsyncClient(
+            timeout=httpx.Timeout(600.0, connect=10.0), trust_env=False,  # 平台内部回环，不走系统代理
+            follow_redirects=False,
+        )
+        logger.warning("全局 _proxy_client 未初始化，回退到临时 client（性能下降）")
 
-        # 读取请求体
-        body = await request.body()
-
-        logger.debug("反代转发: %s %s -> %s", request.method, path, target_url)
-
-        # v0.3.9+ 使用全局复用 AsyncClient（连接池 + keepalive，避免每次请求新建）
-        global _proxy_client
-        client = _proxy_client
-        if client is None:
-            # 兜底：lifespan 未初始化时（不应发生）回退到临时 client
-            client = httpx.AsyncClient(
-                timeout=httpx.Timeout(600.0, connect=10.0), trust_env=False,  # 平台内部回环，不走系统代理
-                follow_redirects=False,
-            )
-            logger.warning("全局 _proxy_client 未初始化，回退到临时 client（性能下降）")
-
-        try:
-            req = client.build_request(
-                request.method,
-                target_url,
-                headers=forward_headers,
-                content=body if body else None,
-            )
-            response = await client.send(req, stream=True)
-        except Exception as e:
-            # 仅临时 client 需要关闭；全局 client 由 lifespan 管理
-            if _proxy_client is None:
-                await client.aclose()
-            logger.exception("反代转发失败: %s %s", request.method, path)
-            return JSONResponse(
-                status_code=502,
-                content={"error": {
-                    "type": "ProxyError",
-                    "message": f"反向代理 ComfyUI 失败: {e}",
-                    "code": 502,
-                }},
-            )
-
-        # 透传响应头（移除 hop-by-hop）
-        # v0.3.9：由于请求时设置了 Accept-Encoding: identity，响应不再压缩，
-        # 无需移除 content-encoding（保持与上游一致性）
-        response_headers = _strip_hop_by_hop_headers(dict(response.headers))
-        # 兜底：如果上游仍返回 content-encoding（不应发生），移除避免浏览器二次解压
-        response_headers.pop("content-encoding", None)
-        response_headers.pop("Content-Encoding", None)
-
-        # 流式响应（SSE / chunked / 普通 JSON 都走这个分支）
-        # v0.3.9：用 aiter_raw(chunk_size=65536) 替代 aiter_bytes()，
-        # 64KB chunk 大幅减少 yield 次数（5.8MB: 5800 → 90 次）
-        is_temp_client = _proxy_client is None
-
-        async def stream_body():
-            try:
-                async for chunk in response.aiter_raw(chunk_size=65536):
-                    if chunk:
-                        yield chunk
-            finally:
-                await response.aclose()
-                if is_temp_client:
-                    await client.aclose()
-
-        return StreamingResponse(
-            stream_body(),
-            status_code=response.status_code,
-            headers=response_headers,
+    try:
+        req = client.build_request(
+            request.method,
+            target_url,
+            headers=forward_headers,
+            content=body if body else None,
+        )
+        response = await client.send(req, stream=True)
+    except Exception as e:
+        # 仅临时 client 需要关闭；全局 client 由 lifespan 管理
+        if _proxy_client is None:
+            await client.aclose()
+        logger.exception("反代转发失败: %s %s", request.method, path)
+        return JSONResponse(
+            status_code=502,
+            content={"error": {
+                "type": "ProxyError",
+                "message": f"反向代理 ComfyUI 失败: {e}",
+                "code": 502,
+            }},
         )
 
-    # ===== WebSocket 反向代理（ComfyUI /ws 端点用于实时事件 + 预览图）=====
-    @app.websocket("/{path:path}")
-    async def websocket_proxy(websocket: WebSocket, path: str):
-        """WebSocket 反向代理到 ComfyUI。
+    # 透传响应头（移除 hop-by-hop）
+    # v0.3.9：由于请求时设置了 Accept-Encoding: identity，响应不再压缩，
+    # 无需移除 content-encoding（保持与上游一致性）
+    response_headers = _strip_hop_by_hop_headers(dict(response.headers))
+    # 兜底：如果上游仍返回 content-encoding（不应发生），移除避免浏览器二次解压
+    response_headers.pop("content-encoding", None)
+    response_headers.pop("Content-Encoding", None)
 
-        用于 ComfyUI 实时事件推送（进度 / 执行结果）和预览图流。
-        v0.3.0：子进程未启动时自动调 _load_impl（auto-load，同 HTTP 反代）。
-        v0.3.7+：使用统一的 auto_load_if_needed helper，含状态机恢复逻辑。
+    # 流式响应（SSE / chunked / 普通 JSON 都走这个分支）
+    # v0.3.9：用 aiter_raw(chunk_size=65536) 替代 aiter_bytes()，
+    # 64KB chunk 大幅减少 yield 次数（5.8MB: 5800 → 90 次）
+    is_temp_client = _proxy_client is None
 
-        注意：本引擎的 /infer 端点已经通过 ComfyuiClient.subscribe_ws 内部订阅
-        ComfyUI WS 事件并转换为 AIReliable SSE 帧推送，前端通常不需要直连
-        ComfyUI WS。此 WebSocket 反代主要用于：
-            1. ComfyUI 自带 Web UI 的 /ws 连接（用户调试时访问 / 路径）
-            2. 高级用户直接订阅 ComfyUI WS 事件（绕过引擎的 SSE 转换）
-        """
-        engine = get_engine()
-        pm_local = engine._process_manager
-
-        # v0.4.2 修复：WS 路径与 HTTP 路径统一走 auto_load_if_needed（无条件调用）。
-        # 旧逻辑仅在"未运行"时调 helper，LOADING 窗口期（Popen 已创建 + 端口已分配
-        # 但健康检查未通过，实测 ~18-30s）直接跳过 auto-load → accept → connect
-        # 未监听端口 → WinError 1225（浏览器每 3s 重连，窗口期内全部失败）。
-        # 统一后 helper 覆盖两种情况：
-        #   - 未运行 → 状态清理 + load（await 完整启动含健康检查）
-        #   - 运行中 → wait_startup_done 等待启动流程完成（就绪或失败）
-        #   - 早已就绪（READY）→ 轻量检查直接返回
+    async def stream_body():
         try:
-            await auto_load_if_needed(engine)
-        except Exception as e:
-            logger.exception("WS 反代 auto-load 失败：%s", e)
-            await websocket.close(code=1011, reason=f"ComfyUI 启动失败: {e}")
-            return
-
-        # 接受客户端 WS 连接
-        await websocket.accept()
-
-        # 构造到 ComfyUI 的 WS URL
-        # ComfyUI WS 端点固定为 /ws，可能带 clientId 查询参数
-        target_ws_url = f"{pm_local.internal_url.replace('http', 'ws')}/{path}"
-        if websocket.query_params:
-            query_str = "&".join(f"{k}={v}" for k, v in websocket.query_params.items())
-            target_ws_url = f"{target_ws_url}?{query_str}"
-
-        logger.debug("WS 反代: /%s -> %s", path, target_ws_url)
-
-        # 用 websockets 库连接 ComfyUI（FastAPI 已依赖）
-        try:
-            import websockets
-        except ImportError:
-            logger.error("websockets 库未安装，无法反代 WS")
-            await websocket.close(code=1011, reason="WS 代理依赖缺失")
-            return
-
-        # v0.3.9 修复 WS 断连：过滤要转发的 headers
-        # 原因：additional_headers=dict(websocket.headers) 会把客户端的
-        #   Sec-WebSocket-* / Host / Origin / Connection / Upgrade 等头
-        #   原样转发给 ComfyUI，websockets 库自己也会生成这些头 → 冲突
-        #   导致握手失败或连接不稳定（前端表现为"已重新连接 → 又断开"）
-        # 修复：只转发必要的非 WS 协议头（User-Agent / Cookie 等），
-        #       不转发 Sec-WebSocket-* / Host / Origin / Connection / Upgrade 等
-        ws_skip_headers = {
-            "host", "origin", "connection", "upgrade", "content-length",
-            "sec-websocket-key", "sec-websocket-version", "sec-websocket-extensions",
-            "sec-websocket-protocol", "sec-websocket-accept",
-            "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest",
-        }
-        forward_ws_headers = {
-            k: v for k, v in websocket.headers.items()
-            if k.lower() not in ws_skip_headers
-        }
-
-        # 双向桥接：client <-> ComfyUI
-        try:
-            async with websockets.connect(
-                target_ws_url,
-                additional_headers=forward_ws_headers,
-                max_size=None,
-                ping_interval=20,      # v0.3.9: 启用 ping 保活，避免空闲断连
-                ping_timeout=10,
-                close_timeout=5,
-            ) as upstream_ws:
-                import asyncio
-
-                async def client_to_upstream():
-                    """客户端 → ComfyUI。"""
-                    try:
-                        while True:
-                            msg = await websocket.receive()
-                            if msg.get("type") == "websocket.disconnect":
-                                break
-                            if "bytes" in msg and msg["bytes"] is not None:
-                                await upstream_ws.send(msg["bytes"])
-                            elif "text" in msg and msg["text"] is not None:
-                                await upstream_ws.send(msg["text"])
-                    except WebSocketDisconnect:
-                        logger.debug("WS 反代：客户端断开连接")
-                    except Exception as e:
-                        logger.warning("WS 反代 client_to_upstream 异常: %s", e)
-
-                async def upstream_to_client():
-                    """ComfyUI → 客户端。"""
-                    try:
-                        async for msg in upstream_ws:
-                            if isinstance(msg, bytes):
-                                await websocket.send_bytes(msg)
-                            else:
-                                await websocket.send_text(msg)
-                    except Exception as e:
-                        # v0.3.9: 不再 pass 吞掉异常，记录日志便于排查
-                        logger.warning("WS 反代 upstream_to_client 异常: %s", e)
-
-                # 并发执行两个方向的转发
-                await asyncio.gather(
-                    client_to_upstream(),
-                    upstream_to_client(),
-                    return_exceptions=True,
-                )
-        except Exception as e:
-            logger.warning("WS 反代异常: %s", e)
+            async for chunk in response.aiter_raw(chunk_size=65536):
+                if chunk:
+                    yield chunk
         finally:
-            try:
-                await websocket.close()
-            except Exception:
-                pass
+            await response.aclose()
+            if is_temp_client:
+                await client.aclose()
+
+    return StreamingResponse(
+        stream_body(),
+        status_code=response.status_code,
+        headers=response_headers,
+    )
+
+
+# ===== WebSocket 反向代理（ComfyUI /ws 端点用于实时事件 + 预览图）=====
+
+@router.websocket("/{path:path}")
+async def websocket_proxy(websocket: WebSocket, path: str):
+    """WebSocket 反向代理到 ComfyUI。
+
+    用于 ComfyUI 实时事件推送（进度 / 执行结果）和预览图流。
+    v0.3.0：子进程未启动时自动调 load（auto-load，同 HTTP 反代）。
+    v0.3.7+：使用统一的 auto_load_if_needed helper，含状态机恢复逻辑。
+
+    注意：本引擎的 /infer 端点已经通过 ComfyuiClient.subscribe_ws 内部订阅
+    ComfyUI WS 事件并转换为 AIReliable SSE 帧推送，前端通常不需要直连
+    ComfyUI WS。此 WebSocket 反代主要用于：
+        1. ComfyUI 自带 Web UI 的 /ws 连接（用户调试时访问 / 路径）
+        2. 高级用户直接订阅 ComfyUI WS 事件（绕过引擎的 SSE 转换）
+    """
+    engine = get_engine()
+    pm_local = engine._process_manager
+
+    # v0.4.2 修复：WS 路径与 HTTP 路径统一走 auto_load_if_needed（无条件调用）。
+    # 旧逻辑仅在"未运行"时调 helper，LOADING 窗口期（Popen 已创建 + 端口已分配
+    # 但健康检查未通过，实测 ~18-30s）直接跳过 auto-load → accept → connect
+    # 未监听端口 → WinError 1225（浏览器每 3s 重连，窗口期内全部失败）。
+    # 统一后 helper 覆盖两种情况：
+    #   - 未运行 → 状态清理 + load（await 完整启动含健康检查）
+    #   - 运行中 → wait_startup_done 等待启动流程完成（就绪或失败）
+    #   - 早已就绪（READY）→ 轻量检查直接返回
+    try:
+        await auto_load_if_needed(engine)
+    except Exception as e:
+        logger.exception("WS 反代 auto-load 失败：%s", e)
+        await websocket.close(code=1011, reason=f"ComfyUI 启动失败: {e}")
+        return
+
+    # 接受客户端 WS 连接
+    await websocket.accept()
+
+    # 构造到 ComfyUI 的 WS URL
+    # ComfyUI WS 端点固定为 /ws，可能带 clientId 查询参数
+    target_ws_url = f"{pm_local.internal_url.replace('http', 'ws')}/{path}"
+    if websocket.query_params:
+        query_str = "&".join(f"{k}={v}" for k, v in websocket.query_params.items())
+        target_ws_url = f"{target_ws_url}?{query_str}"
+
+    logger.debug("WS 反代: /%s -> %s", path, target_ws_url)
+
+    # 用 websockets 库连接 ComfyUI（FastAPI 已依赖）
+    try:
+        import websockets
+    except ImportError:
+        logger.error("websockets 库未安装，无法反代 WS")
+        await websocket.close(code=1011, reason="WS 代理依赖缺失")
+        return
+
+    # v0.3.9 修复 WS 断连：过滤要转发的 headers
+    # 原因：additional_headers=dict(websocket.headers) 会把客户端的
+    #   Sec-WebSocket-* / Host / Origin / Connection / Upgrade 等头
+    #   原样转发给 ComfyUI，websockets 库自己也会生成这些头 → 冲突
+    #   导致握手失败或连接不稳定（前端表现为"已重新连接 → 又断开"）
+    # 修复：只转发必要的非 WS 协议头（User-Agent / Cookie 等），
+    #       不转发 Sec-WebSocket-* / Host / Origin / Connection / Upgrade 等
+    ws_skip_headers = {
+        "host", "origin", "connection", "upgrade", "content-length",
+        "sec-websocket-key", "sec-websocket-version", "sec-websocket-extensions",
+        "sec-websocket-protocol", "sec-websocket-accept",
+        "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest",
+    }
+    forward_ws_headers = {
+        k: v for k, v in websocket.headers.items()
+        if k.lower() not in ws_skip_headers
+    }
+
+    # 双向桥接：client <-> ComfyUI
+    try:
+        async with websockets.connect(
+            target_ws_url,
+            additional_headers=forward_ws_headers,
+            max_size=None,
+            ping_interval=20,      # v0.3.9: 启用 ping 保活，避免空闲断连
+            ping_timeout=10,
+            close_timeout=5,
+        ) as upstream_ws:
+            import asyncio
+
+            async def client_to_upstream():
+                """客户端 → ComfyUI。"""
+                try:
+                    while True:
+                        msg = await websocket.receive()
+                        if msg.get("type") == "websocket.disconnect":
+                            break
+                        if "bytes" in msg and msg["bytes"] is not None:
+                            await upstream_ws.send(msg["bytes"])
+                        elif "text" in msg and msg["text"] is not None:
+                            await upstream_ws.send(msg["text"])
+                except WebSocketDisconnect:
+                    logger.debug("WS 反代：客户端断开连接")
+                except Exception as e:
+                    logger.warning("WS 反代 client_to_upstream 异常: %s", e)
+
+            async def upstream_to_client():
+                """ComfyUI → 客户端。"""
+                try:
+                    async for msg in upstream_ws:
+                        if isinstance(msg, bytes):
+                            await websocket.send_bytes(msg)
+                        else:
+                            await websocket.send_text(msg)
+                except Exception as e:
+                    # v0.3.9: 不再 pass 吞掉异常，记录日志便于排查
+                    logger.warning("WS 反代 upstream_to_client 异常: %s", e)
+
+            # 并发执行两个方向的转发
+            await asyncio.gather(
+                client_to_upstream(),
+                upstream_to_client(),
+                return_exceptions=True,
+            )
+    except Exception as e:
+        logger.warning("WS 反代异常: %s", e)
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 def _strip_hop_by_hop_headers(headers: dict) -> dict:
@@ -934,6 +706,40 @@ def _strip_hop_by_hop_headers(headers: dict) -> dict:
     }
 
 
+# ===== 创建 FastAPI 应用 =====
+
+def create_app(config: EngineConfig | None = None) -> FastAPI:
+    """创建 FastAPI 应用。
+
+    Args:
+        config: 引擎配置（None 则从命令行解析）
+
+    Returns:
+        FastAPI: 配置好的应用实例
+    """
+    global _config
+
+    if config is None:
+        config = parse_args()
+    _config = config
+
+    return build_engine_app(
+        ErnieImageEngine,
+        config=config,
+        title="ERNIE-Image Engine",
+        description=(
+            "AIReliable 平台的 ERNIE-Image 引擎（v0.3.0 ComfyUI 子进程模式 + 反代 ComfyUI UI）"
+        ),
+        version="0.3.0",
+        static_dirs={"/output": config.output_root},
+        redirect_root=None,
+        skip_endpoints=["/load"],
+        extra_routers=[router],
+        startup_hook=_on_startup,
+        shutdown_hook=_on_shutdown,
+    )
+
+
 # ===== 入口 =====
 
 # 模块级 app 实例（uvicorn 直接引用）
@@ -942,34 +748,11 @@ app: Optional[FastAPI] = None
 
 def main() -> None:
     """命令行启动入口。"""
-    global _config, app
+    global app
 
-    # 解析命令行参数
-    _config = parse_args()
-
-    # 配置日志（lifespan 也会配置，这里先配一遍让启动日志可见）
-    setup_engine_logging(
-        engine_id=_config.engine_id,
-        log_level=_config.log_level,
-        log_dir=_config.log_dir,
-    )
-
-    logger.info(
-        "启动 ERNIE-Image 引擎 (v0.3.0 ComfyUI 子进程模式): host=%s, port=%d",
-        _config.host, _config.port,
-    )
-
-    # 创建 app
-    app = create_app(_config)
-
-    # 用 uvicorn 启动
-    import uvicorn
-    uvicorn.run(
-        app,
-        host=_config.host,
-        port=_config.port,
-        log_level=_config.log_level.lower(),
-    )
+    config = parse_args()
+    app = create_app(config)
+    run_engine_server(app, config=config)
 
 
 if __name__ == "__main__":
